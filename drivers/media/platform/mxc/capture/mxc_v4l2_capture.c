@@ -249,7 +249,13 @@ static int mxc_free_frame_buf(cam_data *cam)
 					  cam->frame[i].paddress);
 			cam->frame[i].vaddress = 0;
 		}
+		INIT_LIST_HEAD(&cam->frame[i].queue);
 	}
+	cam->alloced_buffers = 0;
+
+	INIT_LIST_HEAD(&cam->ready_q);
+	INIT_LIST_HEAD(&cam->working_q);
+	INIT_LIST_HEAD(&cam->done_q);
 
 	return 0;
 }
@@ -269,6 +275,11 @@ static int mxc_allocate_frame_buf(cam_data *cam, int count)
 	pr_debug("In MVC:mxc_allocate_frame_buf - size=%d\n",
 		cam->v2f.fmt.pix.sizeimage);
 
+	if (count < 2)
+		count = 2;
+	if (count > FRAME_NUM)
+		count = FRAME_NUM;
+
 	for (i = 0; i < count; i++) {
 		cam->frame[i].vaddress =
 		    dma_alloc_coherent(0,
@@ -278,8 +289,11 @@ static int mxc_allocate_frame_buf(cam_data *cam, int count)
 		if (cam->frame[i].vaddress == 0) {
 			pr_err("ERROR: v4l2 capture: "
 				"mxc_allocate_frame_buf failed.\n");
-			mxc_free_frame_buf(cam);
-			return -ENOBUFS;
+			if (i < 2) {
+				mxc_free_frame_buf(cam);
+				return -ENOBUFS;
+			} else
+				break;
 		}
 		cam->frame[i].buffer.index = i;
 		cam->frame[i].buffer.flags = V4L2_BUF_FLAG_MAPPED;
@@ -291,29 +305,8 @@ static int mxc_allocate_frame_buf(cam_data *cam, int count)
 		cam->frame[i].index = i;
 	}
 
+	cam->alloced_buffers = i;
 	return 0;
-}
-
-/*!
- * Free frame buffers status
- *
- * @param cam    Structure cam_data *
- *
- * @return none
- */
-static void mxc_free_frames(cam_data *cam)
-{
-	int i;
-
-	pr_debug("In MVC:mxc_free_frames\n");
-
-	for (i = 0; i < FRAME_NUM; i++)
-		cam->frame[i].buffer.flags = V4L2_BUF_FLAG_MAPPED;
-
-	cam->enc_counter = 0;
-	INIT_LIST_HEAD(&cam->ready_q);
-	INIT_LIST_HEAD(&cam->working_q);
-	INIT_LIST_HEAD(&cam->done_q);
 }
 
 /*!
@@ -409,9 +402,9 @@ static int mxc_streamon(cam_data *cam)
 
 	pr_debug("In MVC:mxc_streamon\n");
 
-	if (NULL == cam) {
-		pr_err("ERROR! cam parameter is NULL\n");
-		return -1;
+	if (!cam || !cam->enc_update_eba) {
+		pr_err("ERROR! cam parameter is invalid\n");
+		return -EINVAL;
 	}
 
 	if (cam->capture_on) {
@@ -420,19 +413,11 @@ static int mxc_streamon(cam_data *cam)
 		return -1;
 	}
 
-	if (list_empty(&cam->ready_q)) {
-		pr_err("ERROR: v4l2 capture: mxc_streamon buffer has not been "
-			"queued yet\n");
-		return -EINVAL;
-	}
-	if (cam->enc_update_eba &&
-		cam->ready_q.prev == cam->ready_q.next) {
+	if (list_empty(&cam->ready_q) || list_is_singular(&cam->ready_q)) {
 		pr_err("ERROR: v4l2 capture: mxc_streamon buffer need "
 		       "ping pong at least two buffers\n");
 		return -EINVAL;
 	}
-
-	cam->capture_pid = current->pid;
 
 	if (cam->overlay_on == true)
 		stop_preview(cam);
@@ -443,28 +428,23 @@ static int mxc_streamon(cam_data *cam)
 			return err;
 	}
 
-	spin_lock_irqsave(&cam->queue_int_lock, lock_flags);
+	spin_lock_irqsave(&cam->queue_lock, lock_flags);
 	cam->ping_pong_csi = 0;
 	cam->local_buf_num = 0;
-	if (cam->enc_update_eba) {
-		frame =
-		    list_entry(cam->ready_q.next, struct mxc_v4l_frame, queue);
-		list_del(cam->ready_q.next);
-		list_add_tail(&frame->queue, &cam->working_q);
-		frame->ipu_buf_num = cam->ping_pong_csi;
-		err = cam->enc_update_eba(cam, frame->buffer.m.offset);
-
-		frame =
-		    list_entry(cam->ready_q.next, struct mxc_v4l_frame, queue);
-		list_del(cam->ready_q.next);
-		list_add_tail(&frame->queue, &cam->working_q);
-		frame->ipu_buf_num = cam->ping_pong_csi;
-		err |= cam->enc_update_eba(cam, frame->buffer.m.offset);
-		spin_unlock_irqrestore(&cam->queue_int_lock, lock_flags);
-	} else {
-		spin_unlock_irqrestore(&cam->queue_int_lock, lock_flags);
-		return -EINVAL;
-	}
+	frame = list_first_entry(&cam->ready_q, struct mxc_v4l_frame, queue);
+	list_del(&frame->queue);
+	list_add_tail(&frame->queue, &cam->working_q);
+	frame->ipu_buf_num = cam->ping_pong_csi;
+	err = cam->enc_update_eba(cam->ipu, frame->buffer.m.offset,
+				  &cam->ping_pong_csi);
+	
+	frame = list_first_entry(&cam->ready_q, struct mxc_v4l_frame, queue);
+	list_del(&frame->queue);
+	list_add_tail(&frame->queue, &cam->working_q);
+	frame->ipu_buf_num = cam->ping_pong_csi;
+	err |= cam->enc_update_eba(cam->ipu, frame->buffer.m.offset,
+				   &cam->ping_pong_csi);
+	spin_unlock_irqrestore(&cam->queue_lock, lock_flags);
 
 	if (cam->overlay_on == true)
 		start_preview(cam);
@@ -489,7 +469,9 @@ static int mxc_streamon(cam_data *cam)
  */
 static int mxc_streamoff(cam_data *cam)
 {
-	int err = 0;
+	int err;
+	unsigned long lock_flags;
+	struct mxc_v4l_frame *frame;
 
 	pr_debug("In MVC:mxc_streamoff\n");
 
@@ -515,10 +497,38 @@ static int mxc_streamoff(cam_data *cam)
 		}
 	}
 
-	mxc_free_frames(cam);
+	spin_lock_irqsave(&cam->queue_lock, lock_flags);
+
 	mxc_capture_inputs[cam->current_input].status |= V4L2_IN_ST_NO_POWER;
 	cam->capture_on = false;
-	return err;
+
+	/* Looks like IPU code does not call callback for frame that is aborted
+	 * due to stop.
+	 *
+	 * Need to move any frames in ready_q or working_q to done_q and
+	 * mark those as error. Keep order: first working_q, then ready_q */
+
+	while (!list_empty(&cam->working_q)) {
+		frame = list_first_entry(&cam->working_q, struct mxc_v4l_frame, queue);
+		list_del(&frame->queue);
+		frame->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
+		frame->buffer.flags |= (V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_ERROR);
+		list_add_tail(&frame->queue, &cam->done_q);
+	}
+
+	while (!list_empty(&cam->ready_q)) {
+		frame = list_first_entry(&cam->ready_q, struct mxc_v4l_frame, queue);
+		list_del(&frame->queue);
+		frame->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
+		frame->buffer.flags |= (V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_ERROR);
+		list_add_tail(&frame->queue, &cam->done_q);
+	}
+
+	wake_up_interruptible(&cam->enc_queue);
+
+	spin_unlock_irqrestore(&cam->queue_lock, lock_flags);
+
+	return 0;
 }
 
 /*!
@@ -1507,7 +1517,7 @@ static int mxc_v4l2_g_std(cam_data *cam, v4l2_std_id *e)
  * @return  status    0 success, EINVAL invalid frame number,
  *                    ETIME timeout, ERESTARTSYS interrupted by user
  */
-static int mxc_v4l_dqueue(cam_data *cam, struct v4l2_buffer *buf)
+static int mxc_v4l_dqueue(cam_data *cam, struct v4l2_buffer *buf, bool nonblock)
 {
 	int retval = 0;
 	struct mxc_v4l_frame *frame;
@@ -1515,39 +1525,45 @@ static int mxc_v4l_dqueue(cam_data *cam, struct v4l2_buffer *buf)
 
 	pr_debug("In MVC:mxc_v4l_dqueue\n");
 
-	if (!wait_event_interruptible_timeout(cam->enc_queue,
-					      cam->enc_counter != 0,
-					      10 * HZ)) {
-		pr_err("ERROR: v4l2 capture: mxc_v4l_dqueue timeout "
-			"enc_counter %x\n",
-		       cam->enc_counter);
-		return -ETIME;
-	} else if (signal_pending(current)) {
+retry:
+	retval = wait_event_interruptible_timeout(cam->enc_queue,
+			!list_empty(&cam->done_q) || nonblock || !cam->capture_on,
+			10 * HZ);
+	if (signal_pending(current)) {
 		pr_err("ERROR: v4l2 capture: mxc_v4l_dqueue() "
 			"interrupt received\n");
 		return -ERESTARTSYS;
 	}
-
-	if (down_interruptible(&cam->busy_lock))
-		return -EBUSY;
-
-	spin_lock_irqsave(&cam->dqueue_int_lock, lock_flags);
-	cam->enc_counter--;
-
-	frame = list_entry(cam->done_q.next, struct mxc_v4l_frame, queue);
-	list_del(cam->done_q.next);
-	if (frame->buffer.flags & V4L2_BUF_FLAG_DONE) {
-		frame->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
-	} else if (frame->buffer.flags & V4L2_BUF_FLAG_QUEUED) {
-		pr_err("ERROR: v4l2 capture: VIDIOC_DQBUF: "
-			"Buffer not filled.\n");
-		frame->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
-		retval = -EINVAL;
-	} else if ((frame->buffer.flags & 0x7) == V4L2_BUF_FLAG_MAPPED) {
-		pr_err("ERROR: v4l2 capture: VIDIOC_DQBUF: "
-			"Buffer not queued.\n");
-		retval = -EINVAL;
+	if (!retval) {
+		pr_err("ERROR: v4l2 capture: mxc_v4l_dqueue timeout\n");
+		return -ETIME;
 	}
+
+	retval = down_interruptible(&cam->busy_lock);
+	if (retval)
+		return retval;
+
+	spin_lock_irqsave(&cam->queue_lock, lock_flags);
+	if (list_empty(&cam->done_q)) {
+		/* no streaming and no buffers => -EINVAL
+		 * nonblock => -EAGAIN,
+		 * otherwise => retry */
+		if (!cam->capture_on) {
+			retval = -EINVAL;
+			goto out;
+		} else if (nonblock) {
+			retval = -EAGAIN;
+			goto out;
+		} else {
+			spin_unlock_irqrestore(&cam->queue_lock, lock_flags);
+			up(&cam->busy_lock);
+			goto retry;
+		}
+	}
+
+	frame = list_first_entry(&cam->done_q, struct mxc_v4l_frame, queue);
+	list_del(&frame->queue);
+	frame->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
 
 	cam->frame[frame->index].buffer.field = cam->device_type ?
 				V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
@@ -1558,8 +1574,10 @@ static int mxc_v4l_dqueue(cam_data *cam, struct v4l2_buffer *buf)
 	buf->m = cam->frame[frame->index].buffer.m;
 	buf->timestamp = cam->frame[frame->index].buffer.timestamp;
 	buf->field = cam->frame[frame->index].buffer.field;
-	spin_unlock_irqrestore(&cam->dqueue_int_lock, lock_flags);
 
+	retval = 0;
+out:
+	spin_unlock_irqrestore(&cam->queue_lock, lock_flags);
 	up(&cam->busy_lock);
 	return retval;
 }
@@ -1624,8 +1642,9 @@ static int mxc_v4l_open(struct file *file)
 			err = prp_enc_select(cam);
 #endif
 		}
+		if (err)
+			goto oops;
 
-		cam->enc_counter = 0;
 		INIT_LIST_HEAD(&cam->ready_q);
 		INIT_LIST_HEAD(&cam->working_q);
 		INIT_LIST_HEAD(&cam->done_q);
@@ -1756,16 +1775,21 @@ static int mxc_v4l_close(struct file *file)
 	down(&cam->busy_lock);
 
 	/* for the case somebody hit the ctrl C */
-	if (cam->overlay_pid == current->pid && cam->overlay_on) {
-		err = stop_preview(cam);
-		cam->overlay_on = false;
+	if (cam->overlay_filp == file) {
+		if (cam->overlay_on) {
+			err = stop_preview(cam);
+			cam->overlay_on = false;
+		}
+		cam->overlay_filp = NULL;
 	}
-	if (cam->capture_pid == current->pid) {
-		err |= mxc_streamoff(cam);
-		wake_up_interruptible(&cam->enc_queue);
+	if (cam->capture_filp == file) {
+		mxc_streamoff(cam);
+		mxc_free_frame_buf(cam);
+		cam->capture_filp = NULL;
 	}
 
 	if (--cam->open_count == 0) {
+
 		vidioc_int_s_power(cam->sensor, 0);
 		clk_disable_unprepare(sensor->sensor_clk);
 		wait_event_interruptible(cam->power_queue,
@@ -1784,13 +1808,7 @@ static int mxc_v4l_close(struct file *file)
 #endif
 		}
 
-		mxc_free_frame_buf(cam);
 		file->private_data = NULL;
-
-		/* capture off */
-		wake_up_interruptible(&cam->enc_queue);
-		mxc_free_frames(cam);
-		cam->enc_counter++;
 	}
 
 	up(&cam->busy_lock);
@@ -1960,12 +1978,6 @@ static long mxc_v4l_do_ioctl(struct file *file,
 		struct v4l2_requestbuffers *req = arg;
 		pr_debug("   case VIDIOC_REQBUFS\n");
 
-		if (req->count > FRAME_NUM) {
-			pr_err("ERROR: v4l2 capture: VIDIOC_REQBUFS: "
-			       "not enough buffers\n");
-			req->count = FRAME_NUM;
-		}
-
 		if ((req->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
 			pr_err("ERROR: v4l2 capture: VIDIOC_REQBUFS: "
 			       "wrong buffer type\n");
@@ -1973,11 +1985,24 @@ static long mxc_v4l_do_ioctl(struct file *file,
 			break;
 		}
 
+		if (cam->capture_filp && cam->capture_filp != file) {
+			pr_err("ERROR: v4l2 capture: VIDIOC_REQBUFS: "
+			       "streaming is active for other FD\n");
+			retval = -EBUSY;
+			break;
+		}
+
 		mxc_streamoff(cam);
-		if (req->memory & V4L2_MEMORY_MMAP) {
+		if (req->memory == V4L2_MEMORY_MMAP) {
 			mxc_free_frame_buf(cam);
 			retval = mxc_allocate_frame_buf(cam, req->count);
+			if (!retval) {
+				req->count = cam->alloced_buffers;
+				if (!cam->capture_filp)
+					cam->capture_filp = file;
+			}
 		}
+
 		break;
 	}
 
@@ -1990,27 +2015,40 @@ static long mxc_v4l_do_ioctl(struct file *file,
 		pr_debug("   case VIDIOC_QUERYBUF\n");
 
 		if (buf->type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
-			pr_err("ERROR: v4l2 capture: "
-			       "VIDIOC_QUERYBUFS: "
+			pr_err("ERROR: v4l2 capture: VIDIOC_QUERYBUF: "
 			       "wrong buffer type\n");
 			retval = -EINVAL;
 			break;
 		}
 
-		if (buf->memory & V4L2_MEMORY_MMAP) {
+		if (index < 0 || index >= cam->alloced_buffers) {
+			pr_err("ERROR: v4l2 capture: VIDIOC_QUERYBUF: "
+			       "index out of range\n");
+			retval = -EINVAL;
+		}
+
+		if (cam->capture_filp && cam->capture_filp != file) {
+			retval = -EBUSY;
+			break;
+		}
+
+		if (buf->memory == V4L2_MEMORY_MMAP) {
 			memset(buf, 0, sizeof(buf));
 			buf->index = index;
 		}
 
 		down(&cam->param_lock);
-		if (buf->memory & V4L2_MEMORY_USERPTR) {
+		if (buf->memory == V4L2_MEMORY_USERPTR) {
 			mxc_v4l2_release_bufs(cam);
 			retval = mxc_v4l2_prepare_bufs(cam, buf);
 		}
 
-		if (buf->memory & V4L2_MEMORY_MMAP)
+		if (buf->memory == V4L2_MEMORY_MMAP)
 			retval = mxc_v4l2_buffer_status(cam, buf);
 		up(&cam->param_lock);
+
+		if (!retval && !cam->capture_filp)
+			cam->capture_filp = file;
 		break;
 	}
 
@@ -2018,35 +2056,46 @@ static long mxc_v4l_do_ioctl(struct file *file,
 	 * V4l2 VIDIOC_QBUF ioctl
 	 */
 	case VIDIOC_QBUF: {
-		struct v4l2_buffer *buf = arg;
+		struct v4l2_buffer *buf = arg, *tbuf;
 		int index = buf->index;
+
 		pr_debug("   case VIDIOC_QBUF\n");
 
-		spin_lock_irqsave(&cam->queue_int_lock, lock_flags);
-		if ((cam->frame[index].buffer.flags & 0x7) ==
-		    V4L2_BUF_FLAG_MAPPED) {
-			cam->frame[index].buffer.flags |=
-			    V4L2_BUF_FLAG_QUEUED;
-			list_add_tail(&cam->frame[index].queue,
-				      &cam->ready_q);
-		} else if (cam->frame[index].buffer.
-			   flags & V4L2_BUF_FLAG_QUEUED) {
+		if (cam->capture_filp && cam->capture_filp != file) {
+			retval = -EBUSY;
+			break;
+		}
+
+		if (index < 0 || index >= cam->alloced_buffers) {
 			pr_err("ERROR: v4l2 capture: VIDIOC_QBUF: "
-			       "buffer already queued\n");
-			retval = -EINVAL;
-		} else if (cam->frame[index].buffer.
-			   flags & V4L2_BUF_FLAG_DONE) {
-			pr_err("ERROR: v4l2 capture: VIDIOC_QBUF: "
-			       "overwrite done buffer.\n");
-			cam->frame[index].buffer.flags &=
-			    ~V4L2_BUF_FLAG_DONE;
-			cam->frame[index].buffer.flags |=
-			    V4L2_BUF_FLAG_QUEUED;
+			       "index out of range\n");
 			retval = -EINVAL;
 		}
 
-		buf->flags = cam->frame[index].buffer.flags;
-		spin_unlock_irqrestore(&cam->queue_int_lock, lock_flags);
+		tbuf = &cam->frame[index].buffer;
+
+		spin_lock_irqsave(&cam->queue_lock, lock_flags);
+
+		if (tbuf->flags & V4L2_BUF_FLAG_QUEUED) {
+			pr_err("ERROR: v4l2 capture: VIDIOC_QBUF: "
+			       "buffer already queued\n");
+			retval = -EINVAL;
+		} else if (tbuf->flags & V4L2_BUF_FLAG_DONE) {
+			pr_err("ERROR: v4l2 capture: VIDIOC_QBUF: "
+			       "buffer is in done queue %d\n", index);
+			retval = -EINVAL;
+		} else {
+			list_add_tail(&cam->frame[index].queue,
+				      &cam->ready_q);
+			tbuf->flags |= V4L2_BUF_FLAG_QUEUED;
+			tbuf->flags &= ~V4L2_BUF_FLAG_ERROR;
+		}
+
+		buf->flags = tbuf->flags;
+		spin_unlock_irqrestore(&cam->queue_lock, lock_flags);
+
+		if (!retval && !cam->capture_filp)
+			cam->capture_filp = file;
 		break;
 	}
 
@@ -2057,13 +2106,13 @@ static long mxc_v4l_do_ioctl(struct file *file,
 		struct v4l2_buffer *buf = arg;
 		pr_debug("   case VIDIOC_DQBUF\n");
 
-		if ((cam->enc_counter == 0) &&
-			(file->f_flags & O_NONBLOCK)) {
-			retval = -EAGAIN;
-			break;
+		if (cam->capture_filp && cam->capture_filp != file)
+			retval = -EBUSY;
+		else {
+			retval = mxc_v4l_dqueue(cam, buf, file->f_flags & O_NONBLOCK);
+			if (!retval && !cam->capture_filp)
+				cam->capture_filp = file;
 		}
-
-		retval = mxc_v4l_dqueue(cam, buf);
 		break;
 	}
 
@@ -2072,7 +2121,13 @@ static long mxc_v4l_do_ioctl(struct file *file,
 	 */
 	case VIDIOC_STREAMON: {
 		pr_debug("   case VIDIOC_STREAMON\n");
-		retval = mxc_streamon(cam);
+		if (cam->capture_filp && cam->capture_filp != file)
+			retval = -EBUSY;
+		else {
+			retval = mxc_streamon(cam);
+			if (!retval && !cam->capture_filp)
+				cam->capture_filp = file;
+		}
 		break;
 	}
 
@@ -2081,7 +2136,13 @@ static long mxc_v4l_do_ioctl(struct file *file,
 	 */
 	case VIDIOC_STREAMOFF: {
 		pr_debug("   case VIDIOC_STREAMOFF\n");
-		retval = mxc_streamoff(cam);
+		if (cam->capture_filp && cam->capture_filp != file)
+			retval = -EBUSY;
+		else {
+			retval = mxc_streamoff(cam);
+			if (!retval && !cam->capture_filp)
+				cam->capture_filp = file;
+		}
 		break;
 	}
 
@@ -2188,13 +2249,24 @@ static long mxc_v4l_do_ioctl(struct file *file,
 		int *on = arg;
 		pr_debug("   VIDIOC_OVERLAY on=%d\n", *on);
 		if (*on) {
-			cam->overlay_on = true;
-			cam->overlay_pid = current->pid;
-			retval = start_preview(cam);
+			if (cam->overlay_filp)
+				retval = -EBUSY;
+			else {
+				retval = start_preview(cam);
+				if (!retval) {
+					cam->overlay_on = true;
+					cam->overlay_filp = file;
+				}
+			}
 		}
 		if (!*on) {
-			retval = stop_preview(cam);
-			cam->overlay_on = false;
+			if (cam->overlay_filp != file)
+				retval = cam->overlay_filp ? -EBUSY : -EINVAL;
+			else {
+				retval = stop_preview(cam);
+				cam->overlay_on = false;
+				cam->overlay_filp = NULL;
+			}
 		}
 		break;
 	}
@@ -2548,14 +2620,13 @@ static void camera_callback(u32 mask, void *dev)
 
 	pr_debug("In MVC:camera_callback\n");
 
-	spin_lock(&cam->queue_int_lock);
-	spin_lock(&cam->dqueue_int_lock);
+	spin_lock(&cam->queue_lock);
+
 	if (!list_empty(&cam->working_q)) {
 		do_gettimeofday(&cur_time);
 
-		done_frame = list_entry(cam->working_q.next,
-					struct mxc_v4l_frame,
-					queue);
+		done_frame = list_first_entry(&cam->working_q,
+					struct mxc_v4l_frame, queue);
 
 		if (done_frame->ipu_buf_num != cam->local_buf_num)
 			goto next;
@@ -2567,32 +2638,24 @@ static void camera_callback(u32 mask, void *dev)
 		 */
 		done_frame->buffer.timestamp = cur_time;
 
-		if (done_frame->buffer.flags & V4L2_BUF_FLAG_QUEUED) {
-			done_frame->buffer.flags |= V4L2_BUF_FLAG_DONE;
-			done_frame->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
-
-			/* Added to the done queue */
-			list_del(cam->working_q.next);
-			list_add_tail(&done_frame->queue, &cam->done_q);
-
-			/* Wake up the queue */
-			cam->enc_counter++;
-			wake_up_interruptible(&cam->enc_queue);
-		} else
-			pr_err("ERROR: v4l2 capture: camera_callback: "
-				"buffer not queued\n");
+		list_del(&done_frame->queue);
+		list_add_tail(&done_frame->queue, &cam->done_q);
+		
+		done_frame->buffer.flags &= ~V4L2_BUF_FLAG_QUEUED;
+		done_frame->buffer.flags |= V4L2_BUF_FLAG_DONE;
+		
+		wake_up_interruptible(&cam->enc_queue);
 	}
 
 next:
 	if (!list_empty(&cam->ready_q)) {
-		ready_frame = list_entry(cam->ready_q.next,
-					 struct mxc_v4l_frame,
-					 queue);
+		ready_frame = list_first_entry(&cam->ready_q,
+					 struct mxc_v4l_frame, queue);
 		if (cam->enc_update_eba)
 			if (cam->enc_update_eba(
 				cam,
 				ready_frame->buffer.m.offset) == 0) {
-				list_del(cam->ready_q.next);
+				list_del(&ready_frame->queue);
 				list_add_tail(&ready_frame->queue,
 					      &cam->working_q);
 				ready_frame->ipu_buf_num = cam->local_buf_num;
@@ -2604,8 +2667,7 @@ next:
 	}
 
 	cam->local_buf_num = (cam->local_buf_num == 0) ? 1 : 0;
-	spin_unlock(&cam->dqueue_int_lock);
-	spin_unlock(&cam->queue_int_lock);
+	spin_unlock(&cam->queue_lock);
 
 	return;
 }
@@ -2739,8 +2801,7 @@ static int init_camera_struct(cam_data *cam, struct platform_device *pdev)
 
 	cam->enc_callback = camera_callback;
 	init_waitqueue_head(&cam->power_queue);
-	spin_lock_init(&cam->queue_int_lock);
-	spin_lock_init(&cam->dqueue_int_lock);
+	spin_lock_init(&cam->queue_lock);
 
 	cam->self = kmalloc(sizeof(struct v4l2_int_device), GFP_KERNEL);
 	cam->self->module = THIS_MODULE;

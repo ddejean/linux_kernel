@@ -119,16 +119,15 @@ typedef struct _cam_data {
 	struct semaphore param_lock;
 
 	/* Encoder */
+	int alloced_buffers;
 	struct list_head ready_q;
 	struct list_head done_q;
 	struct list_head working_q;
 	int ping_pong_csi;
-	spinlock_t queue_int_lock;
-	spinlock_t dqueue_int_lock;
+	spinlock_t queue_lock;
 	struct mxc_v4l_frame frame[FRAME_NUM];
 	struct mxc_v4l_frame dummy_frame;
 	wait_queue_head_t enc_queue;
-	int enc_counter;
 	dma_addr_t rot_enc_bufs[2];
 	void *rot_enc_bufs_vaddr[2];
 	int rot_enc_buf_size[2];
@@ -201,8 +200,8 @@ typedef struct _cam_data {
 	/* misc status flag */
 	bool overlay_on;
 	bool capture_on;
-	int overlay_pid;
-	int capture_pid;
+	struct file *overlay_filp;
+	struct file *capture_filp;
 	bool low_power;
 	wait_queue_head_t power_queue;
 	unsigned int ipu_id;
