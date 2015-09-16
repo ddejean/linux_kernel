@@ -105,6 +105,10 @@ struct ov5640_mode_info {
 static struct sensor_data ov5640_data;
 static int pwn_gpio, rst_gpio;
 
+/* Mutex is needed since register access can happen both from ioctls
+ * and from workqueue */
+static DEFINE_MUTEX(ov5640_mutex);
+
 static struct reg_value ov5640_init_setting_30fps_VGA[] = {
 
 	{0x3103, 0x11, 0, 0}, {0x3008, 0x82, 0, 5}, {0x3008, 0x42, 0, 0},
@@ -1309,6 +1313,579 @@ err:
 	return retval;
 }
 
+
+/* AF firmware BLOB */
+
+/* FIXME: "no firmware" should become a state, and firmware loading should
+ *        be moved to workqueue. This is the only sane way to handle reloading
+ *        firmware and then restore state after resume.
+ *        Current code just breaks after suspend (because after chip powercycle
+ *        firmware will be no longer running).
+ *
+ * FIXME: implement firmware timeout: if command is not ack'ed in time, reset
+ *        microcontroller and/or reload firmware
+ */
+
+#include "ov5640_af_firmware.c"
+
+/* AF-related registers */
+
+#define	REG_SYSTEM_RESET00	0x3000
+#define REG_AF_CMD_MAIN		0x3022
+#define REG_AF_CMD_ACK		0x3023
+#define REG_AF_PARAM0		0x3024
+#define REG_AF_PARAM1		0x3025
+#define REG_AF_PARAM2		0x3026
+#define REG_AF_PARAM3		0x3027
+#define REG_AF_RESULT		0x3028
+#define REG_AF_FW_STATUS	0x3029
+
+#define REG_SYSTEM_RESET00_RESET_MC	BIT(5)
+
+/* Firmware load timeout (ms) */
+#define AF_FW_INIT_TIMEOUT	1000
+
+/* Formware status values */
+#define AF_FW_STATUS_NOT_RUNNING	0x7f
+#define AF_FW_STATUS_INITIALIZING	0x7e
+#define AF_FW_STATUS_IDLE		0x70
+
+/* REG_AF_CMD_MAIN command codes */
+#define AF_CMD_SINGLE		0x03
+#define AF_CMD_CONTINUOUS	0x04
+#define AF_CMD_PAUSE		0x06
+#define AF_CMD_RELEASE		0x08
+
+/* REG_AF_CMD_ACK values */
+#define AF_ACK_SET		0x01
+#define AF_ACK_DONE		0x00
+
+/* REG_AF_RESULT values */
+#define AF_RESULT_FAILED	0x00
+
+/* AF states visible to driver */
+
+enum {
+	AF_STATE_RELEASED,	/* focus is released to infinity */
+	AF_STATE_FOCUSED,	/* single AF done, lens stay */
+	AF_STATE_CONTINUOUS,	/* continuous AF running */
+	AF_STATE_PAUSED,	/* continuous AF paused */
+
+	AF_STATE_FOCUSING,	/* single AF started but not completed */
+	AF_STATE_STARTING,	/* starting continuous AF */
+	AF_STATE_PAUSING,	/* pausing continuous AF */
+	AF_STATE_RELEASING,	/* releasing focus */
+
+	AF_STATE_PENDING_REFOCUS,	/* was focused but new focus pending */
+	AF_STATE_PENDING_RELEASE,	/* could not send release command */
+};
+
+
+static bool af_fw_ok;		/* is firmware operational? */
+static int af_state;		/* current firmware state */
+static int af_target_state;	/* state needed to reach to complete
+				   request */
+static bool af_error;		/* last focusing failed? */
+static DECLARE_WAIT_QUEUE_HEAD(af_state_wait);
+
+static void af_work_func(struct work_struct *work);
+static DECLARE_DELAYED_WORK(af_work, af_work_func);
+
+static inline void af_schedule_work(void)
+{
+	mod_delayed_work(system_wq, &af_work, 0);
+}
+static inline void af_reschedule_work(void)
+{
+	mod_delayed_work(system_wq, &af_work, 1);
+}
+
+static bool focus_auto = false;
+static int focus_range = V4L2_AUTO_FOCUS_RANGE_NORMAL;
+static bool focus_locked = false;
+
+static int af_init(void)
+{
+	u8 reg;
+	unsigned long timeout;
+	int ret = -EIO;
+
+	static struct reg_value init_af_firmware[] = {
+		{REG_AF_CMD_MAIN, 0x00, 0, 0},
+		{REG_AF_CMD_ACK, 0x00, 0, 0},
+		{REG_AF_PARAM0, 0x00, 0, 0},
+		{REG_AF_PARAM1, 0x00, 0, 0},
+		{REG_AF_PARAM2, 0x00, 0, 0},
+		{REG_AF_PARAM3, 0x00, 0, 0},
+		{REG_AF_RESULT, 0x00, 0, 0},
+		{REG_AF_FW_STATUS, AF_FW_STATUS_NOT_RUNNING, 0, 0},
+	};
+
+	mutex_lock(&ov5640_mutex);
+
+	af_fw_ok = false;
+
+	/* Move microcontroller to reset */
+
+	ret = ov5640_read_reg(REG_SYSTEM_RESET00, &reg);
+	if (ret < 0) {
+		pr_err("%s: microcontroller status read failed\n", __func__);
+		goto out;
+	}
+
+	reg |= REG_SYSTEM_RESET00_RESET_MC;
+	ret = ov5640_write_reg(REG_SYSTEM_RESET00, reg);
+	if (ret < 0) {
+		pr_err("%s: microcontroller reset failed\n", __func__);
+		goto out;
+	}
+
+	/* Download firmware */
+	/* FIXME: better to download firmware using group writes */
+
+	ret = ov5640_download_firmware(ov5640_af_firmware,
+				ARRAY_SIZE(ov5640_af_firmware));
+	if (ret < 0) {
+		pr_err("%s: AF firmware download failed\n", __func__);
+		goto out;
+	}
+
+	/* Set firmware's interface registers to initial values */
+
+	ret = ov5640_download_firmware(init_af_firmware,
+				ARRAY_SIZE(init_af_firmware));
+	if (ret < 0) {
+		pr_err("%s: AF firmware init failed\n", __func__);
+		goto out;
+	}
+
+	/* Start microcontroller */
+
+	reg &= ~REG_SYSTEM_RESET00_RESET_MC;
+	ret = ov5640_write_reg(REG_SYSTEM_RESET00, reg);
+	if (ret < 0) {
+		pr_err("%s: microcontroller start failed\n", __func__);
+		goto out;
+	}
+
+	/* Wait for firmware to become ready */
+
+	timeout = jiffies + msecs_to_jiffies(AF_FW_INIT_TIMEOUT);
+	do {
+		msleep(1);
+		ret = ov5640_read_reg(REG_AF_FW_STATUS, &reg);
+		if (ret < 0) {
+			pr_err("%s: firmware status read failed\n", __func__);
+			goto out;
+		}
+	} while (reg != AF_FW_STATUS_IDLE && time_before(jiffies, timeout));
+
+	if (reg != AF_FW_STATUS_IDLE) {
+		pr_err("%s: firmware is not respoinding\n", __func__);
+		goto out;
+	}
+
+	pr_debug("ov5640_mipi: initialized AF successufully\n");
+
+	af_fw_ok = true;
+	af_state = af_target_state = AF_STATE_RELEASED;
+	af_error = false;
+	focus_auto = false;
+	focus_range = V4L2_AUTO_FOCUS_RANGE_NORMAL;
+	focus_locked = false;
+	
+	ret = 0;
+out:
+	mutex_unlock(&ov5640_mutex);
+	return ret;
+}
+
+static void af_deinit(void)
+{
+	if (!af_fw_ok)
+		return;
+
+	mutex_lock(&ov5640_mutex);
+	af_target_state = AF_STATE_RELEASED;
+	af_schedule_work();
+	mutex_unlock(&ov5640_mutex);
+
+	wait_event_interruptible_timeout(af_state_wait,
+				af_state == AF_STATE_RELEASED, HZ);
+
+	if (unlikely(af_state != AF_STATE_RELEASED))
+		cancel_delayed_work_sync(&af_work);
+
+	af_fw_ok = false;
+}
+
+static void af_set_state(int state)
+{
+	af_state = state;
+
+	if (state == AF_STATE_FOCUSED || state == AF_STATE_PAUSED ||
+	    state == AF_STATE_RELEASED)
+		wake_up_interruptible_all(&af_state_wait);
+}
+
+static int af_state_while_running_command(u8 command)
+{
+	switch (command) {
+	case AF_CMD_SINGLE:
+		return AF_STATE_FOCUSING;
+	case AF_CMD_CONTINUOUS:
+		return AF_STATE_STARTING;
+	case AF_CMD_PAUSE:
+		return AF_STATE_PAUSING;
+	case AF_CMD_RELEASE:
+		return AF_STATE_RELEASING;
+	default:
+		BUG();
+		return AF_STATE_RELEASED;	/* unreached */
+	}
+}
+
+static int af_next_state(int state)
+{
+	switch (state) {
+	case AF_STATE_STARTING:
+		return AF_STATE_CONTINUOUS;
+	case AF_STATE_PAUSING:
+		return AF_STATE_PAUSED;
+	case AF_STATE_RELEASING:
+		return AF_STATE_RELEASED;
+	default:
+		BUG();
+		return AF_STATE_RELEASED;	/* unreached */
+	}
+}
+
+static int af_send_command(u8 command)
+{
+	if (ov5640_write_reg(REG_AF_CMD_ACK, AF_ACK_SET) < 0)
+		return -EIO;;
+
+	if (ov5640_write_reg(REG_AF_CMD_MAIN, command) < 0)
+		return -EIO;
+
+	af_state = af_state_while_running_command(command);
+	return 0;
+}
+
+static void af_work_func(struct work_struct *work)
+{
+	u8 reg;
+
+	mutex_lock(&ov5640_mutex);
+
+	/* If in intermediate state, firmware won't accept a new command
+	 * anyway. Thus check hardware's progress and update state if
+	 * needed, otherwise just wait */
+
+	if (af_state == AF_STATE_FOCUSING || af_state == AF_STATE_STARTING ||
+	    af_state == AF_STATE_PAUSING || af_state == AF_STATE_RELEASING) {
+
+		if (ov5640_read_reg(REG_AF_CMD_ACK, &reg) < 0)
+			goto out;	/* check later */
+		
+		if (reg != AF_ACK_DONE)
+			goto out;	/* no state update yet */
+
+		if (af_state == AF_STATE_FOCUSING) {
+
+			/* single AF done - check status */
+
+			if (ov5640_read_reg(REG_AF_RESULT, &reg) < 0)
+				goto out;	/* try later */
+
+			if (reg == AF_RESULT_FAILED) {
+				if (af_target_state == AF_STATE_FOCUSED) {
+					af_error = true;
+					af_target_state = AF_STATE_RELEASED;
+				}
+				if (af_send_command(AF_CMD_RELEASE) < 0)
+					af_set_state(AF_STATE_PENDING_RELEASE);
+				goto out;
+			}
+
+			af_set_state(AF_STATE_FOCUSED);
+
+		} else		/* other intermediate state */
+			af_set_state(af_next_state(af_state));
+	}
+
+	/* Stop if achieved target state */
+
+	if (likely(af_state == af_target_state))
+		goto out_no_check;
+
+	/* Failed attempts to release must be retried */
+
+	if (unlikely(af_state == AF_STATE_PENDING_RELEASE)) {
+		af_send_command(AF_CMD_RELEASE);
+		goto out;
+	}
+
+	/* Do step to achieve target state */
+
+	switch (af_target_state) {
+
+	case AF_STATE_FOCUSED:
+
+		switch (af_state) {
+		case AF_STATE_RELEASED:
+		case AF_STATE_PENDING_REFOCUS:
+		case AF_STATE_PAUSED:
+			af_send_command(AF_CMD_SINGLE);
+			break;
+		case AF_STATE_CONTINUOUS:
+			af_send_command(AF_CMD_PAUSE);
+			break;
+		default:
+			BUG();
+		}
+		break;
+
+	case AF_STATE_CONTINUOUS:
+
+		switch (af_state) {
+		case AF_STATE_RELEASED:
+		case AF_STATE_PENDING_REFOCUS:
+		case AF_STATE_FOCUSED:
+		case AF_STATE_PAUSED:
+			af_send_command(AF_CMD_CONTINUOUS);
+			break;
+		default:
+			BUG();
+		}
+		break;
+
+	case AF_STATE_PAUSED:
+
+		switch (af_state) {
+		case AF_STATE_RELEASED:
+			af_send_command(AF_CMD_CONTINUOUS);	/* enable VCM */
+			break;
+		case AF_STATE_PENDING_REFOCUS:
+		case AF_STATE_FOCUSED:
+			af_set_state(AF_STATE_PAUSED);		/* already there */
+			break;
+		case AF_STATE_CONTINUOUS:
+			af_send_command(AF_CMD_PAUSE);
+			break;
+		default:
+			BUG();
+		}
+		break;
+
+	case AF_STATE_RELEASED:
+
+		if (af_send_command(AF_CMD_RELEASE) < 0)
+			af_set_state(AF_STATE_PENDING_RELEASE);
+		break;
+
+	default:
+		BUG();
+	}
+
+out:
+	if (af_state != af_target_state)
+		af_reschedule_work();
+out_no_check:
+	mutex_unlock(&ov5640_mutex);
+}
+
+/* Singe autofocus support:
+ * - supports V4L2_AUTO_FOCUS_RANGE_NORMAL and V4L2_AUTO_FOCUS_RANGE_INFINITY
+ * - in V4L2_AUTO_FOCUS_RANGE_NORMAL:
+ *   - V4L2_CID_AUTO_FOCUS_START triggers single auto focus,
+ *   - V4L2_CID_AUTO_FOCUS_STOP releases focus,
+ *   - V4L2_CID_AUTO_FOCUS_STATUS returns focusing state,
+ * - in V4L2_AUTO_FOCUS_RANGE_INFINITY:
+ *   - V4L2_CID_AUTO_FOCUS_START releases focus
+ *   - V4L2_CID_AUTO_FOCUS_STOP also releases focus
+ *   - V4L2_CID_AUTO_FOCUS_STATUS returns V4L2_AUTO_FOCUS_STATUS_REACHED for
+ *     released focus and V4L2_AUTO_FOCUS_STATUS_BUSY for not yet released
+ *     focus
+ */
+static void af_start_single(void)
+{
+	mutex_lock(&ov5640_mutex);
+
+	/* Ignore request is AF firmware is not ok */
+	if (!af_fw_ok)
+		goto out;
+
+	/* Ignore request if V4L2_CID_FOCUS_AUTO is set to TRUE */
+	if (focus_auto)
+		goto out;
+
+	switch (focus_range) {
+	case V4L2_AUTO_FOCUS_RANGE_NORMAL:
+		af_target_state = AF_STATE_FOCUSED;
+		if (af_state == AF_STATE_FOCUSED)
+			af_state = AF_STATE_PENDING_REFOCUS;
+		break;
+	case V4L2_AUTO_FOCUS_RANGE_INFINITY:
+		af_target_state = AF_STATE_RELEASED;
+		break;
+	default:
+		BUG();
+	}
+	af_error = false;
+	af_schedule_work();
+
+out:
+	mutex_unlock(&ov5640_mutex);
+}
+
+static void af_stop_single(void)
+{
+	mutex_lock(&ov5640_mutex);
+
+	/* Ignore request is AF firmware is not ok */
+	if (!af_fw_ok)
+		goto out;
+
+	/* Ignore request if V4L2_CID_FOCUS_AUTO is set to TRUE */
+	if (focus_auto)
+		goto out;
+
+	af_target_state = AF_STATE_RELEASED;
+	af_error = false;
+	af_schedule_work();
+
+out:
+	mutex_unlock(&ov5640_mutex);
+}
+
+static int af_get_status(void)
+{
+	int ret;
+
+	mutex_lock(&ov5640_mutex);
+
+	if (!af_fw_ok || af_error) {
+		ret = V4L2_AUTO_FOCUS_STATUS_FAILED;
+		goto out;
+	}
+
+	switch (focus_range) {
+
+	case V4L2_AUTO_FOCUS_RANGE_NORMAL:
+		if (af_state == AF_STATE_FOCUSED)
+			ret = V4L2_AUTO_FOCUS_STATUS_REACHED;
+		else if (af_state == AF_STATE_RELEASED)
+			ret = V4L2_AUTO_FOCUS_STATUS_IDLE;
+		else
+			ret = V4L2_AUTO_FOCUS_STATUS_BUSY;
+		break;
+
+	case V4L2_AUTO_FOCUS_RANGE_INFINITY:
+		if (af_state == AF_STATE_RELEASED)
+			ret = V4L2_AUTO_FOCUS_STATUS_REACHED;
+		else
+			ret = V4L2_AUTO_FOCUS_STATUS_BUSY;
+		break;
+
+	default:
+		BUG();
+	}
+
+out:	
+	mutex_unlock(&ov5640_mutex);
+
+	return ret;
+}
+
+/* V4L2_CID_FOCUS_AUTO support:
+ *
+ * - mutually exclusive with V4L2_CID_AUTO_FOCUS_(START|STOP)
+ * - supports V4L2_AUTO_FOCUS_RANGE_NORMAL and V4L2_AUTO_FOCUS_RANGE_INFINITY
+ * - RANGE_NORMAL corresponds to STATE_CONTINUOUS
+ *   RANGE_INFINITY corresponds to STATE_RELEASED
+ * - V4L2_CID_3A_LOCK(focus):
+ *   - moves STATE_CONTINUOUS to STATE_PAUSED,
+ *   - delays applying of RANGE change
+ */
+static void apply_focus_auto_update(void)
+{
+	int wanted_state;
+
+	if (focus_auto) {
+		if (focus_locked) {
+			if (af_target_state == AF_STATE_CONTINUOUS)
+				wanted_state = AF_STATE_PAUSED;
+			else
+				wanted_state = af_target_state;
+		} else if (focus_range == V4L2_AUTO_FOCUS_RANGE_NORMAL)
+			wanted_state = AF_STATE_CONTINUOUS;
+		else
+			wanted_state = AF_STATE_RELEASED;
+	} else
+		wanted_state = AF_STATE_RELEASED;
+
+	if (wanted_state != af_target_state) {
+		af_target_state = wanted_state;
+		af_schedule_work();
+	}
+}
+
+static void af_set_auto(bool enable)
+{
+	mutex_lock(&ov5640_mutex);
+
+	if (af_fw_ok && (enable != focus_auto)) {
+		focus_auto = enable;
+		af_error = false;
+		focus_locked = false;
+		apply_focus_auto_update();
+	}
+
+	mutex_unlock(&ov5640_mutex);
+}
+
+static void af_set_focus_range(int range)
+{
+	mutex_lock(&ov5640_mutex);
+
+	if (af_fw_ok) {
+		if (range == V4L2_AUTO_FOCUS_RANGE_INFINITY)
+			focus_range = V4L2_AUTO_FOCUS_RANGE_INFINITY;
+		else
+			focus_range = V4L2_AUTO_FOCUS_RANGE_NORMAL;
+
+		if (focus_auto)
+			apply_focus_auto_update();
+		else if (focus_range == V4L2_AUTO_FOCUS_RANGE_INFINITY &&
+			 af_target_state != AF_STATE_RELEASED) {
+			af_target_state = AF_STATE_RELEASED;
+			af_schedule_work();
+		}
+	}
+
+	mutex_unlock(&ov5640_mutex);
+}
+
+static int af_set_focus_lock(bool locked)
+{
+	mutex_lock(&ov5640_mutex);
+
+	if (af_fw_ok && focus_auto && (locked != focus_locked)) {
+		focus_locked = locked;
+		apply_focus_auto_update();
+		if (locked) {
+			/* wait for lock to apply */
+			mutex_unlock(&ov5640_mutex);
+			return wait_event_interruptible(af_state_wait,
+						af_state == af_target_state);
+		}
+	}
+
+	mutex_unlock(&ov5640_mutex);
+	return 0;
+}
+
 static int ov5640_init_mode(enum ov5640_frame_rate frame_rate,
 			    enum ov5640_mode mode, enum ov5640_mode orig_mode)
 {
@@ -1605,8 +2182,10 @@ static int ioctl_s_parm(struct v4l2_int_device *s, struct v4l2_streamparm *a)
 		}
 
 		orig_mode = sensor->streamcap.capturemode;
+		mutex_lock(&ov5640_mutex);
 		ret = ov5640_init_mode(frame_rate,
 				(u32)a->parm.capture.capturemode, orig_mode);
+		mutex_unlock(&ov5640_mutex);
 		if (ret < 0)
 			return ret;
 
@@ -1690,6 +2269,18 @@ static int ioctl_g_ctrl(struct v4l2_int_device *s, struct v4l2_control *vc)
 	case V4L2_CID_EXPOSURE:
 		vc->value = ov5640_data.ae_mode;
 		break;
+	case V4L2_CID_AUTO_FOCUS_STATUS:
+		vc->value = af_get_status();
+		break;
+	case V4L2_CID_FOCUS_AUTO:
+		vc->value = focus_auto;
+		break;
+	case V4L2_CID_AUTO_FOCUS_RANGE:
+		vc->value = focus_range;
+		break;
+	case V4L2_CID_3A_LOCK:
+		vc->value = focus_locked ? V4L2_LOCK_FOCUS : 0;
+		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -1741,6 +2332,21 @@ static int ioctl_s_ctrl(struct v4l2_int_device *s, struct v4l2_control *vc)
 	case V4L2_CID_HFLIP:
 		break;
 	case V4L2_CID_VFLIP:
+		break;
+	case V4L2_CID_AUTO_FOCUS_START:
+		af_start_single();
+		break;
+	case V4L2_CID_AUTO_FOCUS_STOP:
+		af_stop_single();
+		break;
+	case V4L2_CID_FOCUS_AUTO:
+		af_set_auto(!!vc->value);
+		break;
+	case V4L2_CID_AUTO_FOCUS_RANGE:
+		af_set_focus_range(vc->value);
+		break;
+	case V4L2_CID_3A_LOCK:
+		af_set_focus_lock(!(vc->value & V4L2_LOCK_FOCUS));
 		break;
 	default:
 		retval = -EPERM;
@@ -1898,7 +2504,14 @@ static int ioctl_dev_init(struct v4l2_int_device *s)
 		return -EPERM;
 	}
 
+	mutex_lock(&ov5640_mutex);
 	ret = ov5640_init_mode(frame_rate, ov5640_mode_INIT, ov5640_mode_INIT);
+	mutex_unlock(&ov5640_mutex);
+
+	if (ret == 0) {
+		if (af_init())
+			pr_warning("OV5640 AF init failed\n");
+	}
 
 	return ret;
 }
@@ -1912,6 +2525,8 @@ static int ioctl_dev_init(struct v4l2_int_device *s)
 static int ioctl_dev_exit(struct v4l2_int_device *s)
 {
 	void *mipi_csi2_info;
+
+	af_deinit();
 
 	mipi_csi2_info = mipi_csi2_get_info();
 

@@ -1076,6 +1076,17 @@ static int mxc_v4l2_g_ctrl(cam_data *cam, struct v4l2_control *c)
 			status = -ENODEV;
 		}
 		break;
+	case V4L2_CID_AUTO_FOCUS_STATUS:
+	case V4L2_CID_FOCUS_AUTO:
+	case V4L2_CID_AUTO_FOCUS_RANGE:
+	case V4L2_CID_3A_LOCK:
+		if (cam->sensor)
+			status = vidioc_int_g_ctrl(cam->sensor, c);
+		else {
+			pr_err("ERROR: v4l2 capture: slave not found!\n");
+			status = -ENODEV;
+		}
+		break;
 	default:
 		pr_err("ERROR: v4l2 capture: unsupported ioctrl!\n");
 	}
@@ -1236,6 +1247,18 @@ static int mxc_v4l2_s_ctrl(cam_data *cam, struct v4l2_control *c)
 			cam->ae_mode = c->value;
 			ret = vidioc_int_s_ctrl(cam->sensor, c);
 		} else {
+			pr_err("ERROR: v4l2 capture: slave not found!\n");
+			ret = -ENODEV;
+		}
+		break;
+	case V4L2_CID_AUTO_FOCUS_START:
+	case V4L2_CID_AUTO_FOCUS_STOP:
+	case V4L2_CID_FOCUS_AUTO:
+	case V4L2_CID_AUTO_FOCUS_RANGE:
+	case V4L2_CID_3A_LOCK:
+		if (cam->sensor)
+			ret = vidioc_int_s_ctrl(cam->sensor, c);
+		else {
 			pr_err("ERROR: v4l2 capture: slave not found!\n");
 			ret = -ENODEV;
 		}
@@ -1790,6 +1813,7 @@ static int mxc_v4l_close(struct file *file)
 
 	if (--cam->open_count == 0) {
 
+		vidioc_int_dev_exit(cam->sensor);
 		vidioc_int_s_power(cam->sensor, 0);
 		clk_disable_unprepare(sensor->sensor_clk);
 		wait_event_interruptible(cam->power_queue,
