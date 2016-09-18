@@ -156,6 +156,18 @@
 		compatible = "udoo,poweroff";
 		pwr_5v_gpio = <&gpio2 4 GPIO_ACTIVE_LOW>;
 	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+
+		power {
+			label = "power-key";
+			gpios = <&gpio2 23 GPIO_ACTIVE_LOW>;
+			linux,code = <116>; /* KEY_POWER */
+			gpio-key,wakeup;
+		};
+	};
 };
 
 &audmux { 
